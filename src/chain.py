@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3 import Web3  # pyrefly: ignore [missing-import]
+from web3.exceptions import ContractLogicError  # pyrefly: ignore [missing-import]
 
 # Import UTIL layer — do not duplicate pin_json logic
 sys.path.insert(0, str(Path(__file__).parent))
