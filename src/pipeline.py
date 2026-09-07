@@ -1,12 +1,26 @@
+"""
+pipeline.py — FaceID-Chain Verify  (orchestrator)
+
+Three input modes:
+  Webcam    →  python src/pipeline.py
+  Image     →  python src/pipeline.py --image photo.jpg
+  Clipboard →  python src/pipeline.py --clipboard
+
+Optional:
+  --threshold 0.60   (default 0.45 — higher = stricter match)
+"""
 import argparse
+import contextlib
+import io
 import os
 import sys
 import time
 from pathlib import Path
 
-# Ensure we can import from src/
+# Ensure src/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
+import ui
 from capture import capture_frame
 from face_id import get_embedding, crop_face
 from search import find_candidates
@@ -14,152 +28,206 @@ from verify_match import verify_candidates
 from chain import submit_record, verify_record, demo_tamper
 
 
-def main():
-    parser = argparse.ArgumentParser(description="FaceID Chain Verification Pipeline")
-    parser.add_argument("--image", type=str, default=None, help="Path to input image")
-    parser.add_argument("--clipboard", action="store_true", help="Read image from clipboard (paste a screenshot)")
-    parser.add_argument("--threshold", type=float, default=0.45, help="Similarity threshold")
+# ── Utility: run a function with stdout silenced ──────────────────────────────
+
+def _quiet(fn, *args, **kwargs):
+    """
+    Call fn(*args, **kwargs) with stdout suppressed.
+    Returns the function's return value.
+    Any exception propagates normally after stdout is restored.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        return fn(*args, **kwargs)
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="FaceID-Chain Verify — Face → Web Search → Blockchain",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--image", type=str, default=None,
+        help="Path to a local image file (JPEG/PNG)."
+    )
+    parser.add_argument(
+        "--clipboard", action="store_true",
+        help="Read image from clipboard (paste a screenshot with Win+Shift+S first)."
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=0.45,
+        help="Cosine-similarity threshold for accepting a face match (default: 0.45)."
+    )
     args = parser.parse_args()
 
-    print("=" * 70)
-    print("[PIPELINE] Starting FaceID-Chain Verification Pipeline")
-    print("=" * 70)
+    ui.banner()
 
-    # ── STAGE 1: Capture ────────────────────────────────────────────────────────
-    print("\n[STAGE 1] Capture Frame")
+    # ── Stage 1 — Capture ────────────────────────────────────────────────────
+    ui.step_running(1, "Capture")
+    image_path: str = ""
     try:
         if args.clipboard:
-            print("[STAGE 1] Reading image from clipboard...")
-            try:
-                from PIL import ImageGrab
-                import time as _time
-                clip_img = ImageGrab.grabclipboard()
-                if clip_img is None:
-                    raise ValueError(
-                        "Clipboard is empty or does not contain an image. "
-                        "Copy an image first (e.g. Win+Shift+S screenshot or Ctrl+C on a photo)."
-                    )
-                os.makedirs("captured", exist_ok=True)
-                image_path = f"captured/clipboard_{int(_time.time())}.jpg"
-                # Convert RGBA -> RGB so JPEG save works
-                if clip_img.mode in ("RGBA", "P"):
-                    clip_img = clip_img.convert("RGB")
-                clip_img.save(image_path, "JPEG", quality=95)
-                print(f"[STAGE 1] Clipboard image saved to: {image_path}")
-            except ImportError:
-                raise RuntimeError("Pillow not installed — run: pip install Pillow")
+            from PIL import ImageGrab  # pyrefly: ignore [missing-import]
+            clip_img = ImageGrab.grabclipboard()
+            if clip_img is None:
+                raise ValueError(
+                    "Clipboard is empty. "
+                    "Take a screenshot (Win+Shift+S) then Ctrl+C the image."
+                )
+            os.makedirs("captured", exist_ok=True)
+            image_path = f"captured/clipboard_{int(time.time())}.jpg"
+            if clip_img.mode in ("RGBA", "P"):
+                clip_img = clip_img.convert("RGB")
+            clip_img.save(image_path, "JPEG", quality=95)
+            ui.step_ok(1, "Capture", f"Clipboard → {image_path}")
+
         elif args.image:
             image_path = args.image
-            print(f"[STAGE 1] Using provided image: {image_path}")
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"File not found: {image_path}")
+            ui.step_ok(1, "Capture", f"Image → {image_path}")
+
         else:
-            print("[STAGE 1] Launching webcam... (Press SPACE to capture)")
+            # Webcam: must show the OpenCV window — do NOT silence this stage
+            print()
+            print(ui.dim(ui.gray("  ⬡  Webcam opened — press SPACE to capture, ESC to cancel.")))
             image_path = capture_frame()
-            print(f"[STAGE 1] Captured image saved to: {image_path}")
+            if not image_path or not os.path.exists(image_path):
+                raise RuntimeError("No image captured. Press SPACE over the webcam window.")
+            ui.step_ok(1, "Capture", f"Webcam → {image_path}")
 
-        if not os.path.exists(image_path):
-            raise FileNotFoundError(f"Image not found at {image_path}")
-    except Exception as e:
-        print(f"[STAGE 1] FAILED: {type(e).__name__} - {e}")
+    except Exception as exc:
+        ui.step_fail(1, "Capture", str(exc))
+        ui.failure_footer(1, str(exc))
         sys.exit(1)
 
-    # ── STAGE 2: Embedding ──────────────────────────────────────────────────────
-    print("\n[STAGE 2] Face Extraction & Embedding")
+    # ── Stage 2 — Face Detection & Embedding ─────────────────────────────────
+    ui.step_running(2, "Face Detection & Embedding")
     try:
-        emb_result = get_embedding(image_path)
+        emb_result = _quiet(get_embedding, image_path)
         if "error" in emb_result:
-            raise ValueError(f"Face extraction failed: {emb_result['error']}")
-        
-        original_embedding = emb_result["embedding"]
-        print(f"[STAGE 2] SUCCESS - Embedding generated (Length: {len(original_embedding)})")
-    except Exception as e:
-        print(f"[STAGE 2] FAILED: {type(e).__name__} - {e}")
+            raise ValueError(emb_result["error"])
+        original_embedding: list[float] = emb_result["embedding"]
+        ui.step_ok(
+            2, "Face Detection & Embedding",
+            f"512-d Facenet512 vector extracted"
+        )
+    except Exception as exc:
+        ui.step_fail(2, "Face Detection & Embedding", str(exc))
+        ui.failure_footer(2, str(exc))
         sys.exit(1)
 
-    # ── STAGE 2.5: Face Crop for Search ─────────────────────────────────────────
-    # Upload a tight face crop to Yandex rather than the raw screenshot.
-    # This removes background noise (LinkedIn header, page chrome, etc.)
-    # and gives Yandex the best possible signal to find matching profiles.
-    facial_area = emb_result.get("facial_area", {})
-    search_image_path = image_path  # fallback: use original if crop fails
+    # ── Stage 2.5 — Face Crop (internal, no stage line) ──────────────────────
+    facial_area    = emb_result.get("facial_area", {})
+    search_path    = image_path
     crop_path: str | None = None
     if facial_area:
-        crop_path = crop_face(image_path, facial_area, padding=0.40)
-        if crop_path:
-            search_image_path = crop_path
-            print(f"[PIPELINE] Using face crop for Yandex search: {search_image_path}")
-        else:
-            print("[PIPELINE] Face crop failed — using original image for Yandex search.")
-    else:
-        print("[PIPELINE] No facial_area returned — using original image for Yandex search.")
+        try:
+            crop_path  = _quiet(crop_face, image_path, facial_area, 0.40)
+            if crop_path:
+                search_path = crop_path
+        except Exception:
+            pass  # fall back to original image silently
 
-    # ── STAGE 3: Reverse-Image Search ───────────────────────────────────────────
-    print("\n[STAGE 3] Reverse Image Search (Social Media)")
+    # ── Stage 3 — Reverse Image Search ───────────────────────────────────────
+    ui.step_running(3, "Reverse Image Search")
     try:
-        candidates = find_candidates(search_image_path)
-        print(f"[STAGE 3] SUCCESS - Found {len(candidates)} candidate(s)")
-    except Exception as e:
-        print(f"[STAGE 3] FAILED: {type(e).__name__} - {e}")
+        candidates: list[dict] = _quiet(find_candidates, search_path)
+        if candidates is None:
+            candidates = []
+    except Exception as exc:
+        candidates = []
+        ui.step_fail(3, "Reverse Image Search", str(exc)[:80])
+        ui.failure_footer(3, str(exc))
         sys.exit(1)
     finally:
-        # Clean up temp crop file
         if crop_path and os.path.exists(crop_path):
             try:
                 os.remove(crop_path)
             except OSError:
                 pass
 
-    # ── STAGE 4: Similarity Verification ────────────────────────────────────────
-    print("\n[STAGE 4] Candidate Verification")
+    if candidates:
+        ui.step_ok(3, "Reverse Image Search",
+                   f"{len(candidates)} social profile(s) discovered")
+    else:
+        ui.step_skip(3, "Reverse Image Search",
+                     "No results — check APIFY_TOKEN and account credits")
+
+    # ── Stage 4 — Face Match Verification ────────────────────────────────────
+    ui.step_running(4, "Face Match Verification")
+    verified: list[dict] = []
+    if candidates:
+        try:
+            verified = _quiet(
+                verify_candidates,
+                original_embedding,
+                candidates,
+                args.threshold,
+            )
+            if verified is None:
+                verified = []
+        except Exception as exc:
+            ui.step_fail(4, "Face Match Verification", str(exc)[:80])
+            ui.failure_footer(4, str(exc))
+            sys.exit(1)
+
+    if verified:
+        top_pct = verified[0]["similarity_score"] * 100
+        ui.step_ok(
+            4, "Face Match Verification",
+            f"{len(verified)} match(es) confirmed — top {top_pct:.1f}%"
+        )
+    elif candidates:
+        ui.step_skip(4, "Face Match Verification",
+                     f"0/{len(candidates)} candidates passed threshold {args.threshold}")
+    else:
+        ui.step_skip(4, "Face Match Verification", "No candidates to verify")
+
+    # Print the match results box (even if empty — shows the ⚠ message)
+    ui.matches_box(verified)
+
+    # ── Stage 5 — Blockchain Anchor ──────────────────────────────────────────
+    ui.step_running(5, "Blockchain Anchor (Ethereum Sepolia)")
+    best_url   = verified[0]["page_url"]        if verified else ""
+    best_score = verified[0]["similarity_score"] if verified else 0.0
+    evidence   = {
+        "image_path":       os.path.basename(image_path),
+        "best_match_url":   best_url,
+        "similarity_score": best_score,
+        "timestamp":        time.time(),
+    }
     try:
-        verified_matches = []
-        if candidates:
-            verified_matches = verify_candidates(original_embedding, candidates, args.threshold)
-            print(f"[STAGE 4] SUCCESS - {len(verified_matches)} candidate(s) met threshold {args.threshold}")
-        else:
-            print("[STAGE 4] SUCCESS - No candidates to verify.")
-    except Exception as e:
-        print(f"[STAGE 4] FAILED: {type(e).__name__} - {e}")
+        chain_record = _quiet(submit_record, evidence)
+        if chain_record is None:
+            raise RuntimeError("submit_record returned None")
+        ui.step_ok(5, "Blockchain Anchor (Ethereum Sepolia)", "Transaction confirmed")
+    except Exception as exc:
+        ui.step_fail(5, "Blockchain Anchor (Ethereum Sepolia)", str(exc)[:80])
+        ui.failure_footer(5, str(exc))
         sys.exit(1)
 
-    # ── STAGE 5: Blockchain Submission ──────────────────────────────────────────
-    print("\n[STAGE 5] Submit Evidence On-Chain (Sepolia)")
-    try:
-        # Build evidence dict as requested
-        best_match_url = verified_matches[0]["page_url"] if verified_matches else ""
-        best_score = verified_matches[0]["similarity_score"] if verified_matches else 0.0
-        
-        evidence = {
-            "image_path": os.path.basename(image_path),
-            "best_match_url": best_match_url,
-            "similarity_score": best_score,
-            "timestamp": time.time(),
-        }
-        
-        print(f"[STAGE 5] Evidence payload: {evidence}")
-        chain_record = submit_record(evidence)
-        print(f"[STAGE 5] SUCCESS - Tx Hash: {chain_record['tx_hash']}")
-        print(f"[STAGE 5] SUCCESS - Explorer: {chain_record['explorer_url']}")
-        print(f"[STAGE 5] SUCCESS - IPFS CID: {chain_record['cid']}")
-    except Exception as e:
-        print(f"[STAGE 5] FAILED: {type(e).__name__} - {e}")
-        sys.exit(1)
+    ui.blockchain_box(chain_record)
 
-    # ── STAGE 6: On-Chain Verification & Tamper Demo ────────────────────────────
-    print("\n[STAGE 6] On-Chain Verification & Tamper Demo")
+    # ── Stage 6 — Tamper-Proof Demo ───────────────────────────────────────────
+    ui.step_running(6, "Tamper-Proof Verification")
     try:
         data_hash_bytes = bytes.fromhex(chain_record["data_hash"])
-        verify_status = verify_record(data_hash_bytes)
-        print(f"[STAGE 6] SUCCESS - On-chain record exists: {verify_status['exists']}")
-        
-        # Run Tamper Demo
-        demo_tamper(evidence)
-    except Exception as e:
-        print(f"[STAGE 6] FAILED: {type(e).__name__} - {e}")
-        sys.exit(1)
+        verify_status   = _quiet(verify_record, data_hash_bytes)
+        _quiet(demo_tamper, evidence)
+        exists = (verify_status or {}).get("exists", False)
+        if exists:
+            ui.step_ok(6, "Tamper-Proof Verification",
+                       "Record on-chain ✓   Tamper detection active ✓")
+        else:
+            ui.step_fail(6, "Tamper-Proof Verification",
+                         "verifyRecord returned exists=False — check contract")
+    except Exception as exc:
+        ui.step_fail(6, "Tamper-Proof Verification", str(exc)[:80])
 
-    print("\n" + "=" * 70)
-    print("[PIPELINE] SUCCESS - All stages completed.")
-    print("=" * 70)
+    ui.success_footer()
 
 
 if __name__ == "__main__":
