@@ -1,4 +1,4 @@
-from deepface import DeepFace
+from deepface import DeepFace  # pyrefly: ignore [missing-import]
 import os
 import tempfile
 
@@ -16,7 +16,8 @@ def get_embedding(image_path: str) -> dict:
         result = DeepFace.represent(
             img_path=image_path,
             model_name="Facenet512",
-            detector_backend="mtcnn"
+            detector_backend="mtcnn",
+            align=True,
         )
 
         # In case it returned a list of dicts, grab the first face found
