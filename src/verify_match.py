@@ -4,6 +4,7 @@ import json
 import tempfile
 import requests
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import CV layer — do not duplicate its logic
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -395,53 +396,55 @@ def _get_all_embeddings(image_path: str) -> list[list[float]]:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def verify_candidates(
     original_embedding: list[float],
     candidates: list[dict],
     threshold: float = 0.45,
+    max_candidates: int = 10,
+    max_workers: int = 4,
 ) -> list[dict]:
     """
-    For each candidate:
-      1. Downloads the best available image using platform-specific extraction
-         (LinkedIn full-res CDN, Pinterest originals, og:image, img fallback).
-      2. Validates image size (must be ≥ 80×80px).
+    For each candidate (up to max_candidates):
+      1. Downloads the best available image using platform-specific extraction.
+      2. Validates image size (must be >= 80x80px).
       3. Detects ALL faces in that image with landmark alignment.
       4. Scores each face via cosine similarity; keeps the best score.
+
+    Verification runs in parallel (max_workers threads) for speed.
     Returns only candidates scoring >= threshold, sorted descending by score.
     """
     if not candidates:
         print("[STAGE] verify: No candidates to verify.")
         return []
 
-    print(f"[STAGE] verify: Verifying {len(candidates)} candidate(s) at threshold={threshold}")
+    # Honour max_candidates cap for speed
+    if len(candidates) > max_candidates:
+        print(f"[STAGE] verify: Capping at {max_candidates}/{len(candidates)} candidates for speed.")
+        candidates = candidates[:max_candidates]
 
-    accepted: list[dict] = []
+    print(f"[STAGE] verify: Verifying {len(candidates)} candidate(s) at threshold={threshold} (workers={max_workers})")
 
-    for i, candidate in enumerate(candidates):
-        page_url = candidate.get("page_url", "")
+    def _verify_one(args: tuple[int, dict]) -> dict | None:
+        """Verify a single candidate. Returns the enriched dict or None."""
+        i, candidate = args
+        page_url  = candidate.get("page_url", "")
         image_url = candidate.get("image_url", "")
-        print(f"\n[STAGE] verify: [{i + 1}/{len(candidates)}] {page_url}")
+        print(f"[STAGE] verify: [{i + 1}/{len(candidates)}] {page_url[:80]}")
 
         if not image_url and not page_url:
-            print("[STAGE] verify:   -> No image_url or page_url — skipping.")
-            continue
+            return None
 
-        # If Yandex gave us a direct image_url, try that first (highest quality).
-        # Then fall back to scraping the page_url for an embedded image.
+        # Try direct image_url first, then scrape the page
         tmp_path: str | None = None
         if image_url:
-            print(f"[STAGE] verify:   -> Trying direct image_url: {image_url[:80]}")
             tmp_path = _download_image(image_url)
-
         if tmp_path is None and page_url:
-            print(f"[STAGE] verify:   -> Falling back to page_url scrape.")
             tmp_path = _download_image(page_url)
-
         if tmp_path is None:
-            print("[STAGE] verify:   -> Could not obtain any image — skipping.")
-            continue
+            print(f"[STAGE] verify:   -> Could not obtain image — skipping.")
+            return None
 
-        # Extract ALL faces with alignment and score each one
         all_embeddings = _get_all_embeddings(tmp_path)
         try:
             os.remove(tmp_path)
@@ -449,25 +452,37 @@ def verify_candidates(
             pass
 
         if not all_embeddings:
-            print("[STAGE] verify:   -> No usable face — skipping.")
-            continue
+            print(f"[STAGE] verify:   -> No usable face — skipping.")
+            return None
 
-        # Compute cosine similarity for every face; keep the best score
         valid = [emb for emb in all_embeddings if len(emb) == len(original_embedding)]
         if not valid:
-            print("[STAGE] verify:   -> Embedding length mismatch — skipping.")
-            continue
+            return None
 
         best_score = max(_cosine_similarity(original_embedding, emb) for emb in valid)
         verdict = "ACCEPTED" if best_score >= threshold else "REJECTED"
         print(f"[STAGE] verify:   -> Best score: {best_score:.4f} [{verdict}]")
 
         if best_score >= threshold:
-            accepted.append({**candidate, "similarity_score": round(best_score, 4)})
+            return {**candidate, "similarity_score": round(best_score, 4)}
+        return None
 
-    # Sort accepted by score descending
+    # Run verifications in parallel
+    accepted: list[dict] = []
+    indexed = list(enumerate(candidates))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_verify_one, item): item for item in indexed}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    accepted.append(result)
+            except Exception as exc:
+                print(f"[STAGE] verify: Worker error: {exc}")
+
     accepted.sort(key=lambda x: x["similarity_score"], reverse=True)
-    print(f"\n[STAGE] verify: {len(accepted)} candidate(s) accepted above threshold {threshold}.")
+    print(f"[STAGE] verify: {len(accepted)} candidate(s) accepted above threshold {threshold}.")
     return accepted
 
 

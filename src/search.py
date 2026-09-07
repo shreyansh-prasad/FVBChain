@@ -5,10 +5,6 @@ import requests
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Import UTIL layer — do not duplicate its logic
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ipfs_utils import pin_file
-
 load_dotenv()
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -222,7 +218,8 @@ def find_candidates(image_path: str) -> list[dict]:
     """
     print(f"[STAGE] search: Starting search for {image_path}")
 
-    # Step 1: Get a public image URL
+    # Step 1: Upload image to a public host (catbox.moe → imgbb fallback)
+    # NOTE: No IPFS pin here — IPFS is only needed in Stage 5 (blockchain anchor).
     if not APIFY_TOKEN and not BING_SEARCH_KEY:
         print("[STAGE] search: STOP — neither APIFY_TOKEN nor BING_SEARCH_KEY is set.")
         return []
@@ -232,7 +229,7 @@ def find_candidates(image_path: str) -> list[dict]:
         print("[STAGE] search: STOP — could not upload image to any public host.")
         return []
 
-    # Step 2: Run search engines in parallel (sequentially for simplicity)
+    # Step 2: Run both search engines and merge results
     raw_all: list[dict] = []
     raw_all.extend(_search_yandex(public_url))
     raw_all.extend(_search_bing(public_url))

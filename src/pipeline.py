@@ -60,6 +60,10 @@ def main() -> None:
         "--threshold", type=float, default=0.45,
         help="Cosine-similarity threshold for accepting a face match (default: 0.45)."
     )
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Fast mode: cap at 6 candidates (speeds up demo runs)."
+    )
     args = parser.parse_args()
 
     ui.banner()
@@ -166,6 +170,7 @@ def main() -> None:
                 original_embedding,
                 candidates,
                 args.threshold,
+                6 if args.fast else 10,   # max_candidates
             )
             if verified is None:
                 verified = []
