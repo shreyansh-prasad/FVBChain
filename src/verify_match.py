@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import tempfile
 import requests
 import re
@@ -19,43 +20,150 @@ def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _download_image(url: str) -> str | None:
-    """
-    Downloads an image from url to a temp file.
-    Returns the temp file path, or None on failure.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-    }
-    try:
-        # If url is a webpage (not a direct image), extract the og:image meta tag
-        if not url.lower().split("?")[0].endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
-            page = requests.get(url, timeout=15, headers=headers)
-            # Use regex to find og:image content without needing BeautifulSoup
-            match = re.search(
-                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-                page.text
-            ) or re.search(
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-                page.text
-            )
-            if match:
-                og_url = match.group(1).strip()
-                print(f"[STAGE] verify:   -> og:image extracted: {og_url[:80]}")
-                url = og_url
-            else:
-                print(f"[STAGE] verify:   -> No og:image found, using original URL.")
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-        response = requests.get(url, timeout=30, stream=True, headers=headers)
-        response.raise_for_status()
-        suffix = ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            for chunk in response.iter_content(chunk_size=8192):
+_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
+
+
+def _is_direct_image(url: str) -> bool:
+    return url.lower().split("?")[0].endswith(_IMAGE_EXTS)
+
+
+def _extract_best_image_url(page_html: str, page_url: str) -> str | None:
+    """
+    Tries multiple strategies to extract the highest-quality image URL
+    from a page's HTML, in order of reliability:
+      1. og:image  (standard Open Graph)
+      2. twitter:image / twitter:image:src
+      3. Pinterest JSON-LD (catches pin images that Pinterest hides from og:image)
+      4. First large <img> src that looks like a real photo
+    Returns the best URL found, or None.
+    """
+
+    # --- Strategy 1 & 2: meta tags (og:image, twitter:image) ---
+    meta_patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+    ]
+    for pattern in meta_patterns:
+        m = re.search(pattern, page_html, re.IGNORECASE)
+        if m:
+            url = m.group(1).strip()
+            if url and not url.endswith('.svg'):
+                print(f"[STAGE] verify:   -> meta image extracted: {url[:80]}")
+                return url
+
+    # --- Strategy 3: Pinterest JSON-LD ---
+    if "pinterest" in page_url.lower():
+        json_ld_match = re.search(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                                  page_html, re.DOTALL | re.IGNORECASE)
+        if json_ld_match:
+            try:
+                data = json.loads(json_ld_match.group(1))
+                # Pinterest JSON-LD puts the pin image under 'image' or 'thumbnailUrl'
+                for key in ("image", "thumbnailUrl", "contentUrl"):
+                    val = data.get(key)
+                    if isinstance(val, str) and val.startswith("http"):
+                        print(f"[STAGE] verify:   -> Pinterest JSON-LD image: {val[:80]}")
+                        return val
+                    if isinstance(val, dict):
+                        for subkey in ("url", "contentUrl"):
+                            sub = val.get(subkey, "")
+                            if sub.startswith("http"):
+                                print(f"[STAGE] verify:   -> Pinterest JSON-LD image: {sub[:80]}")
+                                return sub
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # --- Strategy 4: largest <img> on the page ---
+    img_tags = re.findall(
+        r'<img[^>]+src=["\']([^"\']+)["\'][^>]*(?:width=["\'](\d+)["\'])?',
+        page_html, re.IGNORECASE
+    )
+    candidates = [(src, int(w) if w else 0) for src, w in img_tags
+                  if src.startswith("http") and not src.endswith('.svg')]
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_src = candidates[0][0]
+        print(f"[STAGE] verify:   -> Fallback img src: {best_src[:80]}")
+        return best_src
+
+    print("[STAGE] verify:   -> No image URL found in page.")
+    return None
+
+
+def _download_url(url: str, timeout: int = 30) -> str | None:
+    """Downloads a URL to a temp file. Returns path or None on failure."""
+    try:
+        resp = requests.get(url, timeout=timeout, stream=True, headers=_HEADERS)
+        resp.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            for chunk in resp.iter_content(chunk_size=8192):
                 tmp.write(chunk)
             return tmp.name
     except Exception as e:
-        print(f"[STAGE] verify: Failed to download {url} — {type(e).__name__}: {e}")
+        print(f"[STAGE] verify:   -> Download failed ({type(e).__name__}): {e}")
         return None
+
+
+def _download_image(url: str) -> str | None:
+    """
+    Downloads the best-quality image reachable from `url`.
+    If it's a webpage, extracts the best image URL first.
+    """
+    if _is_direct_image(url):
+        return _download_url(url)
+
+    # It's a webpage — fetch and extract the best image URL
+    try:
+        page_resp = requests.get(url, timeout=15, headers=_HEADERS)
+        page_resp.raise_for_status()
+        best_url = _extract_best_image_url(page_resp.text, url)
+    except Exception as e:
+        print(f"[STAGE] verify:   -> Failed to fetch page ({type(e).__name__}): {e}")
+        return None
+
+    if best_url:
+        return _download_url(best_url)
+
+    # Absolute last resort: try downloading the page URL directly as an image
+    print("[STAGE] verify:   -> Last resort: downloading page URL as image.")
+    return _download_url(url)
+
+
+def _get_all_embeddings(image_path: str) -> list[list[float]]:
+    """
+    Extract embeddings for ALL faces found in image_path.
+    Falls back to single-face get_embedding if multi-face extraction fails.
+    Returns a list of embeddings (may be empty if no face detected).
+    """
+    from deepface import DeepFace
+    try:
+        results = DeepFace.represent(
+            img_path=image_path,
+            model_name="Facenet512",
+            detector_backend="mtcnn",
+        )
+        if not isinstance(results, list):
+            results = [results]
+        embeddings = [r["embedding"] for r in results if "embedding" in r]
+        if len(embeddings) > 1:
+            print(f"[STAGE] verify:   -> {len(embeddings)} faces found in candidate — scoring all.")
+        return embeddings
+    except ValueError:
+        return []  # no face detected
+    except Exception as e:
+        print(f"[STAGE] verify:   -> Embedding extraction error: {type(e).__name__}: {e}")
+        return []
 
 
 def verify_candidates(
@@ -64,9 +172,10 @@ def verify_candidates(
     threshold: float = 0.45,
 ) -> list[dict]:
     """
-    For each candidate, downloads its image, re-embeds it, and computes
-    cosine similarity against original_embedding.
-    Prints every score — accepted or not.
+    For each candidate:
+      1. Downloads the best available image (using multi-strategy extraction)
+      2. Detects ALL faces in that image
+      3. Scores each face and keeps the best score
     Returns only candidates scoring >= threshold, sorted descending by score.
     """
     if not candidates:
@@ -83,43 +192,40 @@ def verify_candidates(
         print(f"\n[STAGE] verify: [{i + 1}/{len(candidates)}] {page_url}")
 
         if not image_url and not page_url:
-            print(f"[STAGE] verify:   -> No image_url or page_url — skipping.")
+            print("[STAGE] verify:   -> No image_url or page_url — skipping.")
             continue
 
-        # Download candidate image (try page_url if image_url is missing)
+        # Prefer image_url (direct); fall back to page_url (webpage scrape)
         target_url = image_url if image_url else page_url
         tmp_path = _download_image(target_url)
+
         if tmp_path is None:
-            print(f"[STAGE] verify:   -> Download failed — skipping.")
+            print("[STAGE] verify:   -> Could not obtain image — skipping.")
             continue
 
-        # Re-embed with same model/backend as original
-        embedding_result = get_embedding(tmp_path)
-
-        # Clean up temp file
+        # Extract ALL faces and score each one
+        all_embeddings = _get_all_embeddings(tmp_path)
         try:
             os.remove(tmp_path)
         except OSError:
             pass
 
-        if "error" in embedding_result:
-            print(f"[STAGE] verify:   -> No face detected — skipping.")
+        if not all_embeddings:
+            print("[STAGE] verify:   -> No face detected — skipping.")
             continue
 
-        cand_embedding = embedding_result.get("embedding", [])
-        if len(cand_embedding) != len(original_embedding):
-            print(
-                f"[STAGE] verify:   -> Embedding length mismatch "
-                f"({len(cand_embedding)} vs {len(original_embedding)}) — skipping."
-            )
-            continue
+        # Compute cosine similarity for every face; keep the best score
+        best_score = max(
+            _cosine_similarity(original_embedding, emb)
+            for emb in all_embeddings
+            if len(emb) == len(original_embedding)
+        )
 
-        score = _cosine_similarity(original_embedding, cand_embedding)
-        verdict = "ACCEPTED" if score >= threshold else "REJECTED"
-        print(f"[STAGE] verify:   -> Score: {score:.4f} [{verdict}]")
+        verdict = "ACCEPTED" if best_score >= threshold else "REJECTED"
+        print(f"[STAGE] verify:   -> Best score: {best_score:.4f} [{verdict}]")
 
-        if score >= threshold:
-            accepted.append({**candidate, "similarity_score": round(score, 4)})
+        if best_score >= threshold:
+            accepted.append({**candidate, "similarity_score": round(best_score, 4)})
 
     # Sort accepted by score descending
     accepted.sort(key=lambda x: x["similarity_score"], reverse=True)
@@ -129,7 +235,6 @@ def verify_candidates(
 
 if __name__ == "__main__":
     # Standalone test: expects a local image path as argument.
-    # Will produce a dummy embedding to verify the comparison logic runs.
     if len(sys.argv) > 1:
         test_path = sys.argv[1]
         print(f"[STAGE] verify: Standalone test on {test_path}")
@@ -139,8 +244,6 @@ if __name__ == "__main__":
             sys.exit(1)
         original_emb = result["embedding"]
         print(f"[STAGE] verify: Original embedding length: {len(original_emb)}")
-        # Self-verify: the same image should score 1.0
-        dummy_candidates = [{"page_url": "self-test", "image_url": "", "source": "local"}]
         score = _cosine_similarity(original_emb, original_emb)
         print(f"[STAGE] verify: Self-similarity score: {score:.4f} (expect 1.0)")
     else:
