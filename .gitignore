@@ -1,0 +1,40 @@
+# Secrets — never commit these
+.env
+
+# Test/scratch data — not part of the project
+photo_test_files/
+shruti.png
+shruti.jpg
+image.png
+image.jpg
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Captured / temp images produced at runtime
+captured/
+*_face_crop.jpg
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,7 @@
+opencv-python
+deepface
+tf-keras
+requests
+web3
+python-dotenv
+numpy
